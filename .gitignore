@@ -1,0 +1,24 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+Thumbs.db
+
+# Composer
+/vendor/
+composer.lock
+
+# Node (if build tools added later)
+/node_modules/
+package-lock.json
+
+# Claude Code
+.claude/
+
+# Build artifacts
+*.zip
