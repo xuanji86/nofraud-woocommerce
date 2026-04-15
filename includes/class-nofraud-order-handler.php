@@ -14,7 +14,14 @@ defined( 'ABSPATH' ) || exit;
 class NoFraud_Order_Handler {
 
 	public static function init(): void {
-		add_action( 'woocommerce_payment_complete', [ __CLASS__, 'screen_order' ], 10, 1 );
+		// Standards-compliant gateways fire this when they call $order->payment_complete().
+		add_action( 'woocommerce_payment_complete', [ __CLASS__, 'screen_order' ], 20, 1 );
+
+		// Gateways that bypass payment_complete() and call $order->update_status('processing'|'completed')
+		// directly (e.g. Payroc) only surface via the status-transition hooks below. Priority 20 ensures
+		// the Payroc compat layer (priority 5) has already captured AVS/CVV/last4 onto the order.
+		add_action( 'woocommerce_order_status_processing', [ __CLASS__, 'screen_order' ], 20, 1 );
+		add_action( 'woocommerce_order_status_completed',  [ __CLASS__, 'screen_order' ], 20, 1 );
 	}
 
 	/**
@@ -30,7 +37,21 @@ class NoFraud_Order_Handler {
 			return;
 		}
 
-		if ( $order->get_meta( NoFraud_Settings::META_TRANSACTION_ID ) ) {
+		// Idempotency: this hook can fire multiple times per order (payment_complete +
+		// status_processing + status_completed). A recorded decision or skip flag means
+		// a previous firing already handled it.
+		if ( $order->get_meta( NoFraud_Settings::META_TRANSACTION_ID ) || $order->get_meta( NoFraud_Settings::META_DECISION ) ) {
+			return;
+		}
+
+		$skip = apply_filters( 'nofraud_wc_should_skip_order', self::order_is_ffl_only( $order ), $order );
+		if ( $skip ) {
+			$order->update_meta_data( NoFraud_Settings::META_DECISION, 'skipped' );
+			$order->add_order_note(
+				__( 'NoFraud: Skipped screening — all items require FFL shipment.', 'nofraud-woocommerce' )
+			);
+			$order->save();
+			NoFraud_Settings::log( 'Skipping NoFraud for order #' . $order_id . ' — all line items require FFL shipment.' );
 			return;
 		}
 
@@ -111,6 +132,73 @@ class NoFraud_Order_Handler {
 		}
 	}
 
+	/**
+	 * Returns true when every line item on the order requires FFL shipment.
+	 * Mixed carts (at least one non-FFL item) return false so they still get screened.
+	 */
+	private static function order_is_ffl_only( \WC_Order $order ): bool {
+		$items = $order->get_items();
+		if ( empty( $items ) ) {
+			return false;
+		}
+
+		foreach ( $items as $item ) {
+			$product = $item->get_product();
+			if ( ! $product instanceof \WC_Product ) {
+				return false;
+			}
+			if ( ! self::product_requires_ffl( $product, $order ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Prefer g-FFL Checkout's own helper (handles firearms + state ammunition compliance);
+	 * fall back to the `_firearm_product` meta (checking the variation's parent product too).
+	 */
+	private static function product_requires_ffl( \WC_Product $product, \WC_Order $order ): bool {
+		if ( function_exists( 'item_requires_ffl_shipment' ) ) {
+			return (bool) item_requires_ffl_shipment( $product, $order );
+		}
+
+		if ( 'yes' === $product->get_meta( '_firearm_product' ) ) {
+			return true;
+		}
+
+		$parent_id = $product->get_parent_id();
+		if ( $parent_id ) {
+			$parent = wc_get_product( $parent_id );
+			if ( $parent && 'yes' === $parent->get_meta( '_firearm_product' ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Returns true only with positive evidence that the order's shipping_* fields hold
+	 * the FFL dealer address instead of the customer's own: g-FFL stored the dealer's
+	 * premise street separately and it matches the current shipping_address_1.
+	 */
+	private static function shipping_address_is_ffl_dealer( \WC_Order $order ): bool {
+		if ( ! $order->get_meta( '_shipping_fflno' ) ) {
+			return false;
+		}
+		if ( 'yes' === $order->get_meta( '_is_mixed_cart_order' ) ) {
+			return false;
+		}
+
+		$ffl_premise_street = trim( (string) $order->get_meta( '_shipping_ffl_premise_street' ) );
+		$order_shipping_1   = trim( (string) $order->get_shipping_address_1() );
+
+		return $ffl_premise_street !== '' && $order_shipping_1 !== ''
+			&& 0 === strcasecmp( $ffl_premise_street, $order_shipping_1 );
+	}
+
 	private static function build_transaction_data( \WC_Order $order ): array {
 		$data = [
 			'amount'      => $order->get_total(),
@@ -160,7 +248,21 @@ class NoFraud_Order_Handler {
 			'phoneNumber' => $order->get_billing_phone(),
 		] );
 
-		if ( $order->has_shipping_address() ) {
+		// For mixed FFL/non-FFL orders, g-FFL Checkout preserves the customer's shipping
+		// address so non-FFL items can ship to them. If preservation failed and shipping_*
+		// holds the dealer premise, reuse billTo as shipTo so NoFraud's geo heuristics
+		// aren't corrupted by a dealer address.
+		if ( self::shipping_address_is_ffl_dealer( $order ) ) {
+			NoFraud_Settings::log(
+				'Order #' . $order->get_id() . ' shipping address matches the FFL dealer premise. '
+				. 'Falling back to billing address for NoFraud shipTo.',
+				'warning'
+			);
+			$data['shipTo'] = array_intersect_key(
+				$data['billTo'],
+				array_flip( [ 'firstName', 'lastName', 'address', 'city', 'state', 'zip', 'country' ] )
+			);
+		} elseif ( $order->has_shipping_address() ) {
 			$data['shipTo'] = array_filter( [
 				'firstName' => $order->get_shipping_first_name(),
 				'lastName'  => $order->get_shipping_last_name(),

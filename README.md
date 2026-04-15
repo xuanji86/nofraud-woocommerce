@@ -17,6 +17,8 @@ This plugin integrates the NoFraud fraud screening API into your WooCommerce sto
 - **Admin UI** — Color-coded decision badges on the orders list, a detailed meta box on order edit pages, and a direct link to the NoFraud Portal for each transaction.
 - **API connection test** — One-click button in settings to verify your API key (works with unsaved values).
 - **Payroc gateway support** — Compatibility layer that intercepts Payroc's XML API responses to capture AVS, CVV, and card data that the Payroc plugin discards.
+- **Firearm / FFL awareness** — Orders whose line items all require FFL shipment (via [g-FFL Checkout](https://wordpress.org/plugins/g-ffl-checkout/)) are skipped automatically, since the delivery address is a licensed dealer rather than the customer. Mixed carts (FFL + non-FFL) are still screened, using the customer's own shipping address.
+- **Works with gateways that skip `payment_complete()`** — Screening is hooked onto order status transitions (`processing`, `completed`) as well as `woocommerce_payment_complete`, so gateways like Payroc that move orders straight to `processing` are still covered.
 - **HPOS compatible** — Fully supports WooCommerce High-Performance Order Storage.
 - **Debug logging** — Optional logging to WooCommerce > Status > Logs for troubleshooting.
 
@@ -71,7 +73,13 @@ Customer submits checkout
         |
 Payment gateway processes charge
         |
-woocommerce_payment_complete fires
+Order transitions to processing/completed
+(via woocommerce_payment_complete OR
+ woocommerce_order_status_processing/_completed)
+        |
+All items require FFL shipment? --yes--> Skip, note on order
+        |
+        no
         |
 Plugin sends order data to NoFraud API
         |
@@ -87,6 +95,14 @@ proceeds  order   (awaits
           on checkout
 ```
 
+The screening trigger listens to both `woocommerce_payment_complete` and the
+`woocommerce_order_status_processing` / `woocommerce_order_status_completed`
+transitions. Gateways that call `$order->payment_complete()` (most standards-
+compliant processors) hit the first hook; gateways that bypass it and move the
+order directly into `processing` (e.g. Payroc) are caught by the status hooks.
+A per-order idempotency guard on `_nofraud_transaction_id` ensures each order
+is screened exactly once.
+
 ### Decision Handling
 
 | NoFraud Decision | Default Action | Checkout Behavior |
@@ -95,6 +111,29 @@ proceeds  order   (awaits
 | `fail` | Order cancelled + auto refund | Error shown, customer can retry |
 | `fraudulent` | Order cancelled + auto refund | Error shown, customer can retry |
 | `review` | Order put on hold | Redirect to thank-you page (order held) |
+
+### FFL / Firearm Order Handling
+
+If the [g-FFL Checkout](https://wordpress.org/plugins/g-ffl-checkout/) plugin is active, the screening logic becomes FFL-aware:
+
+| Cart contents | NoFraud behavior | `shipTo` sent |
+|---------------|------------------|---------------|
+| All items require FFL shipment (firearms / ammunition under state compliance) | **Skipped.** An order note is added and the skip is logged. | — |
+| Mix of FFL and non-FFL items | Screened normally. | Customer's own shipping address (g-FFL preserves it on mixed-cart orders). |
+| No FFL items | Screened normally. | Customer's shipping address. |
+
+The "all-FFL" check uses g-FFL Checkout's own `item_requires_ffl_shipment()` helper when available, and falls back to the `_firearm_product` product meta when it isn't.
+
+As a defensive measure, if the order's shipping address appears to be a dealer premise (indicating g-FFL's mixed-cart support is disabled or the address was overwritten), the plugin sends the customer's **billing** address as `shipTo` instead, so NoFraud's geo/velocity heuristics aren't skewed by a dealer address. A warning is logged when this fallback triggers.
+
+The skip logic is filterable — customize it by hooking `nofraud_wc_should_skip_order`:
+
+```php
+add_filter( 'nofraud_wc_should_skip_order', function ( $skip, $order ) {
+    // Return true to skip NoFraud screening for this order.
+    return $skip;
+}, 10, 2 );
+```
 
 ### Supported Payment Gateways
 
@@ -119,7 +158,7 @@ nofraud-woocommerce/
 └── includes/
     ├── class-nofraud-api.php            # NoFraud API client (create transaction, status, test)
     ├── class-nofraud-settings.php       # WooCommerce settings tab, shared constants, AJAX test
-    ├── class-nofraud-order-handler.php  # Order screening on payment_complete
+    ├── class-nofraud-order-handler.php  # Order screening on payment_complete + status transitions; FFL skip
     ├── class-nofraud-checkout.php       # Checkout error display + auto refund
     ├── class-nofraud-webhook.php        # REST endpoint for status update webhooks
     ├── class-nofraud-device-js.php      # Device fingerprinting JS on cart/checkout
@@ -150,7 +189,22 @@ Yes. When NoFraud returns `fail` or `fraudulent`, the plugin attempts an automat
 
 The Payroc WooCommerce plugin extracts AVS, CVV, and approval codes from gateway responses but never stores them to the database. This plugin hooks into WordPress's HTTP API to intercept the Payroc XML responses, parse the missing data, and persist it as order meta before the NoFraud screening runs.
 
+### Why are firearm orders being skipped?
+
+When the [g-FFL Checkout](https://wordpress.org/plugins/g-ffl-checkout/) plugin is active, orders whose line items *all* require FFL shipment are skipped automatically: the physical destination is a licensed dealer, not the customer, so running the billing/shipping address through NoFraud's geo heuristics produces noise rather than signal. Mixed carts (FFL + non-FFL items) are still screened against the customer's own shipping address. See the [FFL / Firearm Order Handling](#ffl--firearm-order-handling) section above for the full behavior matrix and the `nofraud_wc_should_skip_order` filter.
+
 ## Changelog
+
+### 1.2.1
+
+- **Fix: Payroc and other gateways that skip `$order->payment_complete()` were never screened.** Screening now also hooks onto `woocommerce_order_status_processing` and `woocommerce_order_status_completed`, covering gateways that transition orders directly to `processing`. A per-order idempotency guard ensures each order is still screened exactly once.
+- **Firearm / FFL order awareness.** Orders whose line items all require FFL shipment (detected via g-FFL Checkout's `item_requires_ffl_shipment()` helper, with a fallback on the `_firearm_product` product meta) are skipped automatically with an order note and log entry. Mixed carts are still screened.
+- **Defensive shipping-address fallback.** If a mixed-cart order's shipping address is found to be the FFL dealer's premise (e.g. g-FFL mixed-cart support disabled), the plugin sends the customer's billing address as `shipTo` and logs a warning, so NoFraud's geo scoring isn't skewed.
+- New `nofraud_wc_should_skip_order` filter for customizing the skip logic.
+
+### 1.2.0
+
+- Test mode with sandbox credentials, test-transaction button in settings, various checkout polish.
 
 ### 1.0.0
 

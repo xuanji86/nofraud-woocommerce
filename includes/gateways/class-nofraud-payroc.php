@@ -19,6 +19,7 @@ class NoFraud_Payroc {
 	private const META_AUTH_CODE = '_payroc_approval_code';
 	private const META_LAST4     = '_payroc_card_last4';
 	private const META_CARD_TYPE = '_payroc_card_type';
+	private const META_CAPTURED  = '_nofraud_payroc_captured';
 
 	private const GATEWAY_IDS = [ 'payroc', 'payroc_gateway' ];
 
@@ -28,7 +29,13 @@ class NoFraud_Payroc {
 		}
 
 		add_filter( 'http_response', [ __CLASS__, 'capture_payroc_response' ], 10, 3 );
-		add_action( 'woocommerce_payment_complete', [ __CLASS__, 'capture_token_card_data' ], 5, 1 );
+
+		// Payroc's process_payment() never calls $order->payment_complete(); it transitions the
+		// order directly to 'processing' via update_status(). Hook the status transitions so the
+		// captured AVS/CVV/last4 get persisted onto the order before screening (priority 20) runs.
+		add_action( 'woocommerce_payment_complete',        [ __CLASS__, 'capture_token_card_data' ], 5, 1 );
+		add_action( 'woocommerce_order_status_processing', [ __CLASS__, 'capture_token_card_data' ], 5, 1 );
+		add_action( 'woocommerce_order_status_completed',  [ __CLASS__, 'capture_token_card_data' ], 5, 1 );
 	}
 
 	private static function is_active(): bool {
@@ -82,6 +89,11 @@ class NoFraud_Payroc {
 			return;
 		}
 
+		// Idempotency: status-transition hooks can fire this multiple times per order.
+		if ( $order->get_meta( self::META_CAPTURED ) ) {
+			return;
+		}
+
 		$txn_id = $order->get_transaction_id();
 		if ( $txn_id ) {
 			$cached = get_transient( 'nofraud_payroc_' . $txn_id );
@@ -115,6 +127,7 @@ class NoFraud_Payroc {
 			}
 		}
 
+		$order->update_meta_data( self::META_CAPTURED, '1' );
 		$order->save();
 	}
 
