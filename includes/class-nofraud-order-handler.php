@@ -17,11 +17,15 @@ class NoFraud_Order_Handler {
 		// Standards-compliant gateways fire this when they call $order->payment_complete().
 		add_action( 'woocommerce_payment_complete', [ __CLASS__, 'screen_order' ], 20, 1 );
 
-		// Gateways that bypass payment_complete() and call $order->update_status('processing'|'completed')
-		// directly (e.g. Payroc) only surface via the status-transition hooks below. Priority 20 ensures
-		// the Payroc compat layer (priority 5) has already captured AVS/CVV/last4 onto the order.
-		add_action( 'woocommerce_order_status_processing', [ __CLASS__, 'screen_order' ], 20, 1 );
-		add_action( 'woocommerce_order_status_completed',  [ __CLASS__, 'screen_order' ], 20, 1 );
+		// Gateways that bypass payment_complete() only surface via status-transition hooks.
+		// Use transition-specific hooks (from→to) so only genuine payment events trigger
+		// screening. Generic hooks like woocommerce_order_status_completed would also fire
+		// when admin marks historical orders complete (processing→completed), causing those
+		// orders to be screened and incorrectly receive a NoFraud decision.
+		foreach ( [ 'pending', 'on-hold', 'failed' ] as $from ) {
+			add_action( "woocommerce_order_status_{$from}_to_processing", [ __CLASS__, 'screen_order' ], 20, 1 );
+			add_action( "woocommerce_order_status_{$from}_to_completed",  [ __CLASS__, 'screen_order' ], 20, 1 );
+		}
 	}
 
 	/**
@@ -377,7 +381,8 @@ class NoFraud_Order_Handler {
 				'_authorize_net_card_type',
 				'_square_card_brand',
 			] ),
-			'bin'      => self::extract_first_meta( $order, [ '_card_bin', '_stripe_card_bin' ] ),
+			'bin'            => self::extract_first_meta( $order, [ '_payroc_card_bin', '_card_bin', '_stripe_card_bin' ] ),
+			'expirationDate' => self::extract_first_meta( $order, [ '_payroc_card_expiry' ] ),
 		] );
 
 		// Fallback: check nested transaction data for last4.
