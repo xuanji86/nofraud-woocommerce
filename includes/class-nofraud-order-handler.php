@@ -174,12 +174,12 @@ class NoFraud_Order_Handler {
 	/** Why the FFL Orders setting skips this order, or '' to screen it. */
 	private static function ffl_skip_reason( \WC_Order $order ): string {
 		switch ( NoFraud_Settings::ffl_orders_mode() ) {
-			case 'skip_ffl_address':
-				return self::resolve_ship_to( $order )[2] ? __( 'the order goes to an FFL address', 'nofraud-woocommerce' ) : '';
+			case 'skip_ffl_only':
+				return self::order_is_ffl_only( $order ) ? __( 'all items require FFL shipment', 'nofraud-woocommerce' ) : '';
 			case 'screen':
 				return '';
-			default:
-				return self::order_is_ffl_only( $order ) ? __( 'all items require FFL shipment', 'nofraud-woocommerce' ) : '';
+			default: // skip_ffl_address
+				return self::resolve_ship_to( $order )[2] ? __( 'the order goes to an FFL address', 'nofraud-woocommerce' ) : '';
 		}
 	}
 

@@ -482,7 +482,7 @@ class NoFraud_Settings {
 					'skip_ffl_address' => __( 'Skip whenever the order goes to an FFL address (incl. mixed carts shipped to the dealer, in-store pickup)', 'nofraud-woocommerce' ),
 					'screen'           => __( 'Screen all orders', 'nofraud-woocommerce' ),
 				],
-				'default' => 'skip_ffl_only',
+				'default' => 'skip_ffl_address',
 			],
 			'debug_logging' => [
 				'name'    => __( 'Debug Logging', 'nofraud-woocommerce' ),
@@ -521,7 +521,7 @@ class NoFraud_Settings {
 
 	/** @return string skip_ffl_only | skip_ffl_address | screen */
 	public static function ffl_orders_mode(): string {
-		return (string) get_option( 'nofraud_wc_ffl_orders', 'skip_ffl_only' );
+		return (string) get_option( 'nofraud_wc_ffl_orders', 'skip_ffl_address' );
 	}
 
 	/**
