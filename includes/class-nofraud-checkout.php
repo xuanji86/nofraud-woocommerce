@@ -91,23 +91,50 @@ class NoFraud_Checkout {
 		self::restore_cart( $order );
 	}
 
+	/**
+	 * Rebuild the cart the way WC's own "order again" does (WC_Cart_Session::
+	 * populate_cart_from_order): chosen attributes come from the order item meta, so
+	 * "Any …" variations survive, and items are set directly rather than through
+	 * add_to_cart(), which would fire add-to-cart tracking/CRM hooks for a rejected order.
+	 */
 	private static function restore_cart( \WC_Order $order ): void {
 		if ( ! function_exists( 'WC' ) || ! WC()->cart || ! WC()->cart->is_empty() ) {
 			return;
 		}
+		$cart = [];
 		foreach ( $order->get_items() as $item ) {
-			if ( ! $item instanceof \WC_Order_Item_Product || ! $item->get_product_id() ) {
+			if ( ! $item instanceof \WC_Order_Item_Product ) {
 				continue;
 			}
-			$variation_id = $item->get_variation_id();
-			WC()->cart->add_to_cart(
-				$item->get_product_id(),
-				$item->get_quantity(),
-				$variation_id,
-				$variation_id ? wc_get_product_variation_attributes( $variation_id ) : []
-			);
+			$product_id   = (int) $item->get_product_id();
+			$variation_id = (int) $item->get_variation_id();
+			$product      = wc_get_product( $variation_id ?: $product_id );
+			if ( ! $product || ! $product->is_in_stock() ) {
+				continue;
+			}
+			$variations = [];
+			foreach ( $item->get_meta_data() as $meta ) {
+				if ( taxonomy_is_product_attribute( $meta->key ) ) {
+					$variations[ 'attribute_' . sanitize_title( $meta->key ) ] = sanitize_title( $meta->value );
+				} elseif ( meta_is_product_attribute( $meta->key, $meta->value, $product_id ) ) {
+					$variations[ 'attribute_' . sanitize_title( $meta->key ) ] = html_entity_decode( wc_clean( $meta->value ), ENT_QUOTES, get_bloginfo( 'charset' ) );
+				}
+			}
+			$key          = WC()->cart->generate_cart_id( $product_id, $variation_id, $variations );
+			$cart[ $key ] = [
+				'key'          => $key,
+				'product_id'   => $product_id,
+				'variation_id' => $variation_id,
+				'variation'    => $variations,
+				'quantity'     => $product->is_sold_individually() ? 1 : $item->get_quantity(),
+				'data'         => $product,
+				'data_hash'    => wc_get_cart_item_data_hash( $product ),
+			];
 		}
-		WC()->cart->calculate_totals(); // Persists the cart to the session.
+		if ( $cart ) {
+			WC()->cart->set_cart_contents( $cart );
+			WC()->cart->calculate_totals(); // Persists the cart to the session.
+		}
 	}
 
 	/**

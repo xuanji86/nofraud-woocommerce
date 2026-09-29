@@ -10,8 +10,11 @@ defined( 'ABSPATH' ) || exit;
 
 class NoFraud_Webhook {
 
+	private const SYNC_HOOK = 'nofraud_wc_webhook_sync';
+
 	public static function init(): void {
 		add_action( 'rest_api_init', [ __CLASS__, 'register_routes' ] );
+		add_action( self::SYNC_HOOK, [ __CLASS__, 'deferred_sync' ], 10, 1 );
 	}
 
 	public static function register_routes(): void {
@@ -65,14 +68,34 @@ class NoFraud_Webhook {
 		}
 
 		// The endpoint is unauthenticated unless a secret is set; cap the status lookups
-		// it can trigger so it cannot be used to hammer the API with the store's key.
+		// it can trigger so it cannot be used to hammer the API with the store's key. A
+		// throttled hit is deferred, never dropped: it may be NoFraud's real notification.
 		$throttle = 'nofraud_wh_' . $order->get_id();
 		if ( get_transient( $throttle ) ) {
-			return new \WP_REST_Response( [ 'error' => 'Too many requests.' ], 429 );
+			$args = [ $order->get_id() ];
+			if ( function_exists( 'as_has_scheduled_action' ) && ! as_has_scheduled_action( self::SYNC_HOOK, $args, 'nofraud' ) ) {
+				as_schedule_single_action( time() + 15, self::SYNC_HOOK, $args, 'nofraud' );
+			}
+			return new \WP_REST_Response( [ 'status' => 'queued' ], 202 );
 		}
 		set_transient( $throttle, 1, 10 );
 
-		$status = NoFraud_API::get_transaction_status( $stored_id );
+		return self::sync_order( $order );
+	}
+
+	public static function deferred_sync( $order_id ): void {
+		$order = wc_get_order( (int) $order_id );
+		if ( $order ) {
+			self::sync_order( $order );
+		}
+	}
+
+	/**
+	 * Re-read the order's decision from the status API and apply any change.
+	 */
+	private static function sync_order( \WC_Order $order ): \WP_REST_Response {
+		$stored_id = (string) $order->get_meta( NoFraud_Settings::META_TRANSACTION_ID );
+		$status    = NoFraud_API::get_transaction_status( $stored_id );
 		if ( empty( $status['success'] ) || empty( $status['decision'] ) ) {
 			NoFraud_Settings::log( 'Webhook: status lookup failed for order #' . $order->get_id() . ': ' . ( $status['error'] ?? 'no decision' ), 'error' );
 			return new \WP_REST_Response( [ 'error' => 'Could not verify decision.' ], 503 );

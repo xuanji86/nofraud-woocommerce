@@ -86,9 +86,9 @@ class NoFraud_Order_Handler {
 		if ( empty( $result['success'] ) || 'error' === ( $result['decision'] ?? '' ) ) {
 			$error = $result['error'] ?? ( $result['message'] ?? 'NoFraud returned decision "error"' );
 			NoFraud_Settings::log( 'NoFraud screening error for order #' . $order_id . ': ' . $error, 'error' );
-			// 4xx (bad payload, invalid key) will fail the same way again.
+			// 4xx (bad payload, invalid key) will fail the same way again — except 429.
 			$code = (int) ( $result['code'] ?? 0 );
-			self::schedule_retry( $order, $error, $code >= 400 && $code < 500 );
+			self::schedule_retry( $order, $error, $code >= 400 && $code < 500 && 429 !== $code );
 			return;
 		}
 

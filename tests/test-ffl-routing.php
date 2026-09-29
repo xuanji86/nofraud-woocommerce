@@ -144,6 +144,10 @@ $check( 'retry: transition does not re-screen', $calls === $api_calls );
 $api_reply = [ 200, [ 'id' => '11111111-2222-3333-4444-555555555555', 'decision' => 'pass' ] ];
 NoFraud_Order_Handler::retry_screen( $o->get_id() );
 $check( 'retry: job screens it', 'pass' === $fresh( $o )->get_meta( '_nofraud_decision' ) );
+$api_reply = [ 429, [ 'Errors' => [ 'Too Many Requests' ] ] ];
+$o = $mk( [ $acc ] );
+NoFraud_Order_Handler::screen_order( $o->get_id() );
+$check( 'retry: 429 is retried', 'retrying' === $fresh( $o )->get_meta( '_nofraud_decision' ) );
 $api_reply = [ 403, [ 'Errors' => [ 'Not Authorized' ] ] ];
 $o = $mk( [ $acc ] );
 NoFraud_Order_Handler::screen_order( $o->get_id() );
@@ -157,6 +161,68 @@ wc_reduce_stock_levels( $o->get_id() );
 $reject = new ReflectionMethod( 'NoFraud_Checkout', 'reject' );
 $reject->invoke( null, $fresh( $o ) );
 $check( 'reject: stock restored', 5 === (int) wc_get_product( $stocked->get_id() )->get_stock_quantity(), (string) wc_get_product( $stocked->get_id() )->get_stock_quantity() );
+
+// 6. Cart restore: 'Any' attribute variations keep the shopper's choice; no add_to_cart hooks.
+if ( ! WC()->cart && function_exists( 'wc_load_cart' ) ) {
+	wc_load_cart();
+}
+if ( WC()->cart ) {
+	$attr = new WC_Product_Attribute();
+	$attr->set_name( 'Color' );
+	$attr->set_options( [ 'Red', 'Blue' ] );
+	$attr->set_variation( true );
+	$var_parent = new WC_Product_Variable();
+	$var_parent->set_name( 'NF test sling' );
+	$var_parent->set_attributes( [ $attr ] );
+	$var_parent->save();
+	$var = new WC_Product_Variation();
+	$var->set_parent_id( $var_parent->get_id() );
+	$var->set_attributes( [ 'color' => '' ] ); // Any Color
+	$var->set_regular_price( '20' );
+	$var->save();
+	$products[] = wc_get_product( $var->get_id() );
+	$products[] = wc_get_product( $var_parent->get_id() );
+
+	$o = wc_create_order();
+	$o->add_product( wc_get_product( $var->get_id() ), 1, [ 'variation' => [ 'attribute_color' => 'Red' ] ] );
+	$o->add_product( $acc, 2 );
+	$o->set_status( 'cancelled' );
+	$o->save();
+	$orders[] = $o;
+
+	WC()->cart->empty_cart();
+	$added = 0;
+	$count_add = function () use ( &$added ) { $added++; };
+	add_action( 'woocommerce_add_to_cart', $count_add );
+	$reject->invoke( null, $fresh( $o ) );
+	remove_action( 'woocommerce_add_to_cart', $count_add );
+
+	$colors = [];
+	$qty    = 0;
+	foreach ( WC()->cart->get_cart() as $ci ) {
+		$qty += $ci['quantity'];
+		if ( $ci['variation_id'] ) {
+			$colors[] = $ci['variation']['attribute_color'] ?? '';
+		}
+	}
+	$check( 'cart restore: all lines back', 3 === $qty, (string) $qty );
+	$check( 'cart restore: Any variation keeps Red', [ 'Red' ] === $colors, wp_json_encode( $colors ) );
+	$check( 'cart restore: no add_to_cart hooks', 0 === $added, (string) $added );
+	WC()->cart->empty_cart();
+} else {
+	echo "SKIP cart restore (no cart in this context)\n";
+}
+
+// 7. Webhook: a throttled hit is deferred (202 + queued sync), not dropped.
+$o = $mk( [ $acc ], [ '_nofraud_transaction_id' => '99999999-2222-3333-4444-555555555555', '_nofraud_decision' => 'review' ], 'on-hold' );
+set_transient( 'nofraud_wh_' . $o->get_id(), 1, 10 );
+$req = new WP_REST_Request( 'POST', '/nofraud/v1/webhook' );
+$req->set_param( 'invoiceNumber', (string) $o->get_id() );
+$res = NoFraud_Webhook::handle_webhook( $req );
+$queued = function_exists( 'as_has_scheduled_action' ) && as_has_scheduled_action( 'nofraud_wc_webhook_sync', [ $o->get_id() ], 'nofraud' );
+$check( 'webhook: throttled hit deferred', 202 === $res->get_status() && $queued, $res->get_status() . ' queued=' . (int) $queued );
+as_unschedule_all_actions( 'nofraud_wc_webhook_sync', [ $o->get_id() ], 'nofraud' );
+delete_transient( 'nofraud_wh_' . $o->get_id() );
 
 // Cleanup.
 remove_filter( 'pre_http_request', $stub, 10 );
