@@ -54,20 +54,16 @@ class NoFraud_Order_Handler {
 			return;
 		}
 
-		// Per NoFraud: FFL-only orders are ours to skip (then uncovered) or to send with the
+		// Per NoFraud: FFL orders are ours to skip (then uncovered) or to send with the
 		// dealer as shipTo (then covered). Never allowlist them on NoFraud's side instead.
-		$skip = apply_filters(
-			'nofraud_wc_should_skip_order',
-			! NoFraud_Settings::screen_ffl_orders() && self::order_is_ffl_only( $order ),
-			$order
-		);
-		if ( $skip ) {
+		$reason = self::ffl_skip_reason( $order );
+		if ( apply_filters( 'nofraud_wc_should_skip_order', '' !== $reason, $order ) ) {
+			$reason = $reason ?: __( 'excluded by the nofraud_wc_should_skip_order filter', 'nofraud-woocommerce' );
 			$order->update_meta_data( NoFraud_Settings::META_DECISION, 'skipped' );
-			$order->add_order_note(
-				__( 'NoFraud: Skipped screening — all items require FFL shipment.', 'nofraud-woocommerce' )
-			);
+			/* translators: %s: skip reason */
+			$order->add_order_note( sprintf( __( 'NoFraud: Skipped screening — %s.', 'nofraud-woocommerce' ), $reason ) );
 			$order->save();
-			NoFraud_Settings::log( 'Skipping NoFraud for order #' . $order_id . ' — all line items require FFL shipment.' );
+			NoFraud_Settings::log( 'Skipping NoFraud for order #' . $order_id . ' — ' . $reason . '.' );
 			return;
 		}
 
@@ -175,6 +171,18 @@ class NoFraud_Order_Handler {
 		}
 	}
 
+	/** Why the FFL Orders setting skips this order, or '' to screen it. */
+	private static function ffl_skip_reason( \WC_Order $order ): string {
+		switch ( NoFraud_Settings::ffl_orders_mode() ) {
+			case 'skip_ffl_address':
+				return self::resolve_ship_to( $order )[2] ? __( 'the order goes to an FFL address', 'nofraud-woocommerce' ) : '';
+			case 'screen':
+				return '';
+			default:
+				return self::order_is_ffl_only( $order ) ? __( 'all items require FFL shipment', 'nofraud-woocommerce' ) : '';
+		}
+	}
+
 	/**
 	 * Returns true when every line item on the order ships to an FFL. Mixed carts
 	 * return false so they are always screened.
@@ -231,7 +239,7 @@ class NoFraud_Order_Handler {
 	 *    against the ATF licensee list.
 	 *  - Otherwise (regular goods, C&R to the collector) → the order's shipping address.
 	 *
-	 * @return array{0: array<string,string>|null, 1: bool} [shipTo, isBopis]
+	 * @return array{0: array<string,string>|null, 1: bool, 2: bool} [shipTo, isBopis, goes to an FFL address]
 	 */
 	private static function resolve_ship_to( \WC_Order $order ): array {
 		$first = $order->get_shipping_first_name() ?: $order->get_billing_first_name();
@@ -247,7 +255,7 @@ class NoFraud_Order_Handler {
 				'state'     => $home['state'] ?? '',
 				'zip'       => $home['postcode'] ?? '',
 				'country'   => ( $home['country'] ?? '' ) ?: $order->get_shipping_country(),
-			] ), false ];
+			] ), false, false ];
 		}
 
 		$premise = trim( (string) $order->get_meta( '_shipping_ffl_premise_street' ) );
@@ -267,7 +275,7 @@ class NoFraud_Order_Handler {
 				'state'     => $order->{"get_{$type}_state"}(),
 				'zip'       => $order->{"get_{$type}_postcode"}(),
 				'country'   => $order->{"get_{$type}_country"}(),
-			] ), false ];
+			] ), false, false ];
 		}
 
 		$license = trim( (string) $order->get_meta( '_shipping_fflno' ) );
@@ -283,7 +291,7 @@ class NoFraud_Order_Handler {
 				'state'     => $wc->get_base_state(),
 				'zip'       => $wc->get_base_postcode(),
 				'country'   => $wc->get_base_country(),
-			] ), true ];
+			] ), true, true ];
 		}
 
 		if ( '' !== $license && '' !== $premise ) {
@@ -296,7 +304,7 @@ class NoFraud_Order_Handler {
 				'state'     => (string) $order->get_meta( '_shipping_ffl_premise_state' ),
 				'zip'       => (string) $order->get_meta( '_shipping_ffl_premise_zip' ),
 				'country'   => 'US',
-			] ), false ];
+			] ), false, true ];
 		}
 
 		if ( $order->has_shipping_address() ) {
@@ -309,10 +317,10 @@ class NoFraud_Order_Handler {
 				'state'     => $order->get_shipping_state(),
 				'zip'       => $order->get_shipping_postcode(),
 				'country'   => $order->get_shipping_country(),
-			] ), false ];
+			] ), false, false ];
 		}
 
-		return [ null, false ];
+		return [ null, false, false ];
 	}
 
 	/** Drop empty fields and clip to NoFraud's 128-char address limit. */

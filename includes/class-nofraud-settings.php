@@ -472,12 +472,17 @@ class NoFraud_Settings {
 				],
 				'default' => 'hold',
 			],
-			'screen_ffl_orders' => [
-				'name'    => __( 'FFL-only Orders', 'nofraud-woocommerce' ),
-				'type'    => 'checkbox',
-				'desc'    => __( 'Screen orders where every item ships to an FFL dealer (sent with the dealer as the ship-to address). Only screened orders are covered by chargeback protection; unchecked skips them.', 'nofraud-woocommerce' ),
-				'id'      => 'nofraud_wc_screen_ffl_orders',
-				'default' => 'no',
+			'ffl_orders' => [
+				'name'    => __( 'FFL Orders', 'nofraud-woocommerce' ),
+				'type'    => 'select',
+				'desc'    => __( 'Which firearm orders to send to NoFraud. Only screened orders are covered by chargeback protection. Screened orders going to a dealer use the dealer as the ship-to address.', 'nofraud-woocommerce' ),
+				'id'      => 'nofraud_wc_ffl_orders',
+				'options' => [
+					'skip_ffl_only'    => __( 'Skip when every item requires FFL', 'nofraud-woocommerce' ),
+					'skip_ffl_address' => __( 'Skip whenever the order goes to an FFL address (incl. mixed carts shipped to the dealer, in-store pickup)', 'nofraud-woocommerce' ),
+					'screen'           => __( 'Screen all orders', 'nofraud-woocommerce' ),
+				],
+				'default' => 'skip_ffl_only',
 			],
 			'debug_logging' => [
 				'name'    => __( 'Debug Logging', 'nofraud-woocommerce' ),
@@ -514,8 +519,9 @@ class NoFraud_Settings {
 		return get_option( 'nofraud_wc_fail_action', 'cancel' );
 	}
 
-	public static function screen_ffl_orders(): bool {
-		return 'yes' === get_option( 'nofraud_wc_screen_ffl_orders', 'no' );
+	/** @return string skip_ffl_only | skip_ffl_address | screen */
+	public static function ffl_orders_mode(): string {
+		return (string) get_option( 'nofraud_wc_ffl_orders', 'skip_ffl_only' );
 	}
 
 	/**
