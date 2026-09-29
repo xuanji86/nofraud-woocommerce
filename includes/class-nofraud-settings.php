@@ -15,6 +15,8 @@ class NoFraud_Settings {
 	public const META_SCREENED_AT        = '_nofraud_screened_at';
 	public const META_MESSAGE            = '_nofraud_message';
 	public const META_WEBHOOK_UPDATED_AT = '_nofraud_webhook_updated_at';
+	/** Set when NoFraud itself put the order on hold, so a later pass only releases its own holds. */
+	public const META_HOLD               = '_nofraud_hold';
 
 	public static function init(): void {
 		add_action( 'admin_menu', [ __CLASS__, 'add_menu_page' ] );
@@ -363,7 +365,7 @@ class NoFraud_Settings {
 		];
 
 		$response = wp_remote_post(
-			'https://apitest.nofraud.com/',
+			'https://apitest.nofraud.com/transaction',
 			[
 				'timeout' => 30,
 				'headers' => [ 'Content-Type' => 'application/json' ],
@@ -470,6 +472,18 @@ class NoFraud_Settings {
 				],
 				'default' => 'hold',
 			],
+			'ffl_orders' => [
+				'name'    => __( 'FFL Orders', 'nofraud-woocommerce' ),
+				'type'    => 'select',
+				'desc'    => __( 'Which firearm orders to send to NoFraud. Only screened orders are covered by chargeback protection. Screened orders going to a dealer use the dealer as the ship-to address.', 'nofraud-woocommerce' ),
+				'id'      => 'nofraud_wc_ffl_orders',
+				'options' => [
+					'skip_ffl_only'    => __( 'Skip when every item requires FFL', 'nofraud-woocommerce' ),
+					'skip_ffl_address' => __( 'Skip whenever the order goes to an FFL address (incl. mixed carts shipped to the dealer, in-store pickup)', 'nofraud-woocommerce' ),
+					'screen'           => __( 'Screen all orders', 'nofraud-woocommerce' ),
+				],
+				'default' => 'skip_ffl_address',
+			],
 			'debug_logging' => [
 				'name'    => __( 'Debug Logging', 'nofraud-woocommerce' ),
 				'type'    => 'checkbox',
@@ -505,6 +519,25 @@ class NoFraud_Settings {
 		return get_option( 'nofraud_wc_fail_action', 'cancel' );
 	}
 
+	/** @return string skip_ffl_only | skip_ffl_address | screen */
+	public static function ffl_orders_mode(): string {
+		return (string) get_option( 'nofraud_wc_ffl_orders', 'skip_ffl_address' );
+	}
+
+	/**
+	 * Put the order on hold on NoFraud's behalf; the marker lets a later pass release
+	 * only this hold, never one placed by staff or another plugin (e.g. ffl-core's
+	 * restricted-state guard).
+	 */
+	public static function hold( \WC_Order $order, string $note ): void {
+		// Already on hold means someone else (staff, ffl-core's restricted-state guard,
+		// which runs before screening) owns it — never claim it, or a pass would release it.
+		if ( ! $order->has_status( 'on-hold' ) ) {
+			$order->update_meta_data( self::META_HOLD, '1' );
+		}
+		$order->update_status( 'on-hold', $note );
+	}
+
 	public static function get_review_action(): string {
 		return get_option( 'nofraud_wc_review_action', 'hold' );
 	}
@@ -521,7 +554,7 @@ class NoFraud_Settings {
 		if ( 'cancel' === self::get_fail_action() ) {
 			$order->update_status( 'cancelled', $note );
 		} else {
-			$order->update_status( 'on-hold', $note );
+			self::hold( $order, $note );
 		}
 	}
 

@@ -188,13 +188,9 @@ class NoFraud_Payroc {
 	}
 
 	private static function is_payroc_url( string $url ): bool {
-		static $payroc_hosts = [
-			'payments.globalone.me',
-			'payments.sandbox.globalone.me',
-			'testpayments.globalone.me',
-			'api.payroc.com',
-			'test.payroc.com',
-		];
+		// Payroc 2.7.9.x posts XML to payments.payroc.com / payments.uat.payroc.com;
+		// older builds used the GlobalOne hosts. Match the registrable domains.
+		static $payroc_hosts = [ 'payroc.com', 'globalone.me' ];
 
 		$host = wp_parse_url( $url, PHP_URL_HOST );
 		if ( ! $host ) {
