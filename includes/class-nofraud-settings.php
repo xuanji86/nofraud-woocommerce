@@ -530,7 +530,11 @@ class NoFraud_Settings {
 	 * restricted-state guard).
 	 */
 	public static function hold( \WC_Order $order, string $note ): void {
-		$order->update_meta_data( self::META_HOLD, '1' );
+		// Already on hold means someone else (staff, ffl-core's restricted-state guard,
+		// which runs before screening) owns it — never claim it, or a pass would release it.
+		if ( ! $order->has_status( 'on-hold' ) ) {
+			$order->update_meta_data( self::META_HOLD, '1' );
+		}
 		$order->update_status( 'on-hold', $note );
 	}
 

@@ -173,7 +173,7 @@ class NoFraud_API {
 			if ( ! empty( $body['Errors'] ) ) {
 				$error .= ': ' . implode( '; ', (array) $body['Errors'] );
 			}
-			return [ 'success' => false, 'error' => $error ];
+			return [ 'success' => false, 'error' => $error, 'code' => (int) $code ];
 		}
 
 		if ( ! is_array( $body ) ) {

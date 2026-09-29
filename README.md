@@ -212,7 +212,10 @@ Firearm-only orders ship to a licensed dealer and the buyer passes a 4473/NICS c
 - **Fix: Payroc AVS/CVV/card data was never captured** — the host allowlist did not match Payroc 2.7.9.x (`payments.payroc.com` / `payments.uat.payroc.com`).
 - **Webhook hardening:** the payload is only a trigger; the decision is re-read from `GET /status/{nf-token}/{id}`. `id` may be the portal URL. A `pass` releases only holds NoFraud placed (not ffl-core restricted-state or staff holds); a late `fail` on a completed order only adds a note; async cancels now refund.
 - **API conformance:** create-transaction posts to `/transaction`; `payment.creditCard` and `billTo` are always objects; AVS/CVV codes outside the API's length limits are dropped; gateway `transaction-id` / `authcode` are sent; addresses clipped to 128 chars.
-- **Retries:** a transport failure or `error` decision is retried up to 3 times (5 min apart, Action Scheduler) instead of leaving the order silently unscreened.
+- **Retries:** a transport/5xx failure or `error` decision gets up to 2 retries (3 attempts, 5 min apart, Action Scheduler); 4xx errors (bad payload, invalid key) are not retried. While a retry is queued the order is marked `retrying` so status changes don't screen it twice; a final failure is marked `error` with a "NOT screened" note.
+- **Sync fail cleanup:** when the decision lands inside the gateway's payment call (Payroc), the gateway still reduced stock and emptied the cart after the order was cancelled; the checkout interceptor now restores both so the shopper can actually retry.
+- **Holds:** NoFraud never claims an order that was already on hold (e.g. ffl-core's restricted-state guard), so a later `pass` cannot release it.
+- Tests: `wp eval-file tests/test-ffl-routing.php` (FFL Orders modes × order types, ship-to, hold ownership, retry lock).
 
 ### 1.2.1
 

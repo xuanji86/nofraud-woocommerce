@@ -64,6 +64,14 @@ class NoFraud_Webhook {
 			return new \WP_REST_Response( [ 'error' => 'Order has no NoFraud transaction.' ], 404 );
 		}
 
+		// The endpoint is unauthenticated unless a secret is set; cap the status lookups
+		// it can trigger so it cannot be used to hammer the API with the store's key.
+		$throttle = 'nofraud_wh_' . $order->get_id();
+		if ( get_transient( $throttle ) ) {
+			return new \WP_REST_Response( [ 'error' => 'Too many requests.' ], 429 );
+		}
+		set_transient( $throttle, 1, 10 );
+
 		$status = NoFraud_API::get_transaction_status( $stored_id );
 		if ( empty( $status['success'] ) || empty( $status['decision'] ) ) {
 			NoFraud_Settings::log( 'Webhook: status lookup failed for order #' . $order->get_id() . ': ' . ( $status['error'] ?? 'no decision' ), 'error' );

@@ -39,7 +39,7 @@ class NoFraud_Checkout {
 
 		NoFraud_Settings::log( 'Checkout intercepted for order #' . $order_id . ': decision=' . $decision );
 
-		self::attempt_refund( $order );
+		self::reject( $order );
 
 		wc_add_notice( self::get_error_message(), 'error' );
 
@@ -74,9 +74,40 @@ class NoFraud_Checkout {
 
 		NoFraud_Settings::log( 'Block checkout intercepted for order #' . $order->get_id() . ': decision=' . $decision );
 
-		self::attempt_refund( $order );
+		self::reject( $order );
 
 		throw new \Exception( self::get_error_message() );
+	}
+
+	/**
+	 * Undo a payment the shopper is being told to retry. The decision lands inside the
+	 * gateway's own update_status(), so the gateway (e.g. Payroc) still reduces stock and
+	 * empties the cart AFTER the order was cancelled — WC's cancel-time restock ran too
+	 * early to see it. Put both back so the "try again" message is actionable.
+	 */
+	private static function reject( \WC_Order $order ): void {
+		self::attempt_refund( $order );
+		wc_increase_stock_levels( $order ); // Only restores items flagged _reduced_stock.
+		self::restore_cart( $order );
+	}
+
+	private static function restore_cart( \WC_Order $order ): void {
+		if ( ! function_exists( 'WC' ) || ! WC()->cart || ! WC()->cart->is_empty() ) {
+			return;
+		}
+		foreach ( $order->get_items() as $item ) {
+			if ( ! $item instanceof \WC_Order_Item_Product || ! $item->get_product_id() ) {
+				continue;
+			}
+			$variation_id = $item->get_variation_id();
+			WC()->cart->add_to_cart(
+				$item->get_product_id(),
+				$item->get_quantity(),
+				$variation_id,
+				$variation_id ? wc_get_product_variation_attributes( $variation_id ) : []
+			);
+		}
+		WC()->cart->calculate_totals(); // Persists the cart to the session.
 	}
 
 	/**
