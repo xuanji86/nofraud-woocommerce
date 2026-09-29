@@ -180,21 +180,29 @@ class NoFraud_Order_Handler {
 	 * return false so they are always screened.
 	 */
 	private static function order_is_ffl_only( \WC_Order $order ): bool {
+		// g-FFL Checkout also writes `_order_shipment_type`, but stamps a mixed cart
+		// `ffl_only` when its mixed-cart support is off — so ask its per-item helper.
+		$g_ffl = function_exists( 'item_requires_ffl_shipment' );
+
 		// ffl-core classifies the cart at checkout (firearms plus its state ammo /
-		// all-goods compliance rules) and stores the verdict on the order.
+		// all-goods compliance rules); its `ffl_only` means every item needs an FFL.
 		$type = (string) $order->get_meta( '_order_shipment_type' );
-		if ( '' !== $type ) {
+		if ( ! $g_ffl && '' !== $type ) {
 			return 'ffl_only' === $type;
 		}
 
-		// Orders ffl-core never classified (admin- or REST-created): firearm flag only.
+		// g-FFL, or orders ffl-core never classified (admin- or REST-created).
 		$items = $order->get_items();
 		if ( empty( $items ) ) {
 			return false;
 		}
 		foreach ( $items as $item ) {
 			$product = $item->get_product();
-			if ( ! $product instanceof \WC_Product || ! self::is_firearm( $product ) ) {
+			if ( ! $product instanceof \WC_Product ) {
+				return false;
+			}
+			$requires = $g_ffl ? (bool) item_requires_ffl_shipment( $product, $order ) : self::is_firearm( $product );
+			if ( ! $requires ) {
 				return false;
 			}
 		}
@@ -216,6 +224,8 @@ class NoFraud_Order_Handler {
 	 *
 	 *  - Mixed cart, shopper sent the non-firearm items home (ffl-core `ffl_core_ship_home`)
 	 *    → that home address; the firearm on the FFL leg is not covered.
+	 *  - g-FFL mixed cart (`_is_mixed_cart_order`): g-FFL keeps the customer's address in
+	 *    shipping_* → that address (billing if it was overwritten with the dealer's).
 	 *  - In-store pickup (the store's own FFL) → the store address, flagged isBopis.
 	 *  - Anything else going to a dealer → the dealer premise, which NoFraud matches
 	 *    against the ATF licensee list.
@@ -240,6 +250,26 @@ class NoFraud_Order_Handler {
 			] ), false ];
 		}
 
+		$premise = trim( (string) $order->get_meta( '_shipping_ffl_premise_street' ) );
+
+		if ( 'yes' === $order->get_meta( '_is_mixed_cart_order' ) ) {
+			$overwritten = '' !== $premise && 0 === strcasecmp( $premise, trim( $order->get_shipping_address_1() ) );
+			$type        = $overwritten ? 'billing' : 'shipping';
+			if ( $overwritten ) {
+				NoFraud_Settings::log( 'Order #' . $order->get_id() . ': g-FFL mixed cart carries the dealer address; using billing as shipTo.', 'warning' );
+			}
+			return [ self::address( [
+				'firstName' => $first,
+				'lastName'  => $last,
+				'company'   => $order->{"get_{$type}_company"}(),
+				'address'   => trim( $order->{"get_{$type}_address_1"}() . ' ' . $order->{"get_{$type}_address_2"}() ),
+				'city'      => $order->{"get_{$type}_city"}(),
+				'state'     => $order->{"get_{$type}_state"}(),
+				'zip'       => $order->{"get_{$type}_postcode"}(),
+				'country'   => $order->{"get_{$type}_country"}(),
+			] ), false ];
+		}
+
 		$license = trim( (string) $order->get_meta( '_shipping_fflno' ) );
 		$pickup  = trim( (string) get_option( 'ffl_core_in_store_pickup_license', '' ) );
 		if ( '' !== $license && $license === $pickup ) {
@@ -256,7 +286,6 @@ class NoFraud_Order_Handler {
 			] ), true ];
 		}
 
-		$premise = trim( (string) $order->get_meta( '_shipping_ffl_premise_street' ) );
 		if ( '' !== $license && '' !== $premise ) {
 			return [ self::address( [
 				'firstName' => $first,

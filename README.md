@@ -114,18 +114,19 @@ is screened exactly once.
 
 ### FFL / Firearm Order Handling
 
-FFL awareness reads the order meta written by **ffl-core** (the OSA/CGA FFL checkout plugin). The rules follow NoFraud's guidance (2026-09-28): coverage follows the address that is screened, and FFL orders must not be allowlisted on NoFraud's side.
+FFL awareness works with **ffl-core** (the OSA/CGA FFL checkout plugin) and with **[g-FFL Checkout](https://wordpress.org/plugins/g-ffl-checkout/)**; both write the same `_shipping_ffl*` meta. The rules follow NoFraud's guidance (2026-09-28): coverage follows the address that is screened, and FFL orders must not be allowlisted on NoFraud's side.
 
 | Order | NoFraud behavior | `shipTo` sent |
 |-------|------------------|---------------|
 | Every item ships to an FFL (`_order_shipment_type = ffl_only`) | Skipped with an order note (not covered) — unless **FFL-only Orders** is checked, then screened (covered). | Dealer premise from ffl-core (`_shipping_ffl_premise_*`); NoFraud matches it against the ATF licensee list. |
 | Mixed cart, shopper sent the non-firearm items home (`ffl_core_ship_home`) | Screened; all items (firearm included) in `lineItems`. Only the home-bound items are covered. | Customer's home address. |
-| Mixed cart, everything to the FFL (ffl-core default) | Screened. | Dealer premise. |
+| g-FFL mixed cart (`_is_mixed_cart_order`, mixed-cart support on) | Screened. | Customer's shipping address (billing if g-FFL overwrote it with the dealer's). |
+| Mixed cart, everything to the FFL (ffl-core default; g-FFL with mixed-cart support off) | Screened. | Dealer premise. |
 | In-store pickup (the store's own FFL, `ffl_core_in_store_pickup_license`) | Screened when not skipped; `isBopis: "true"`. | Store base address. |
 | C&R transfer (ships to the collector) | As above. | Order shipping address (the collector's). |
 | No FFL items | Screened. | Order shipping address. |
 
-Orders ffl-core never classified (admin/REST-created) fall back to the `_firearm_product` flag (variations inherit the parent's). The FFL license and shipment type also go to NoFraud reviewers in `userFields`.
+FFL-only detection: with g-FFL active, its per-item `item_requires_ffl_shipment()` helper (g-FFL stamps `_order_shipment_type = ffl_only` on mixed carts when its mixed-cart support is off, so that field is not trusted there); otherwise ffl-core's `_order_shipment_type`; orders neither classified (admin/REST-created) fall back to the `_firearm_product` flag (variations inherit the parent's). The FFL license and shipment type also go to NoFraud reviewers in `userFields`.
 
 The skip logic is filterable — customize it by hooking `nofraud_wc_should_skip_order`:
 
@@ -198,7 +199,7 @@ Firearm-only orders ship to a licensed dealer and the buyer passes a 4473/NICS c
 
 ### 1.3.0
 
-- **ffl-core compatibility** (replaces g-FFL Checkout): FFL-only detection from `_order_shipment_type`; `shipTo` = home address on split mixed carts, dealer premise otherwise, store address + `isBopis` for in-store pickup. New **FFL-only Orders** setting (default off = skip).
+- **ffl-core compatibility** (g-FFL Checkout still supported): FFL-only detection from `_order_shipment_type`; `shipTo` = home address on split mixed carts, dealer premise otherwise, store address + `isBopis` for in-store pickup. New **FFL-only Orders** setting (default off = skip).
 - **Fix: Block checkout never intercepted a fail.** The hook ran before payment; it now runs after the Store API payment hook and returns the error to the shopper.
 - **Fix: Payroc AVS/CVV/card data was never captured** — the host allowlist did not match Payroc 2.7.9.x (`payments.payroc.com` / `payments.uat.payroc.com`).
 - **Webhook hardening:** the payload is only a trigger; the decision is re-read from `GET /status/{nf-token}/{id}`. `id` may be the portal URL. A `pass` releases only holds NoFraud placed (not ffl-core restricted-state or staff holds); a late `fail` on a completed order only adds a note; async cancels now refund.
