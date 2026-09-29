@@ -13,7 +13,13 @@ defined( 'ABSPATH' ) || exit;
 
 class NoFraud_Order_Handler {
 
+	private const META_ATTEMPTS = '_nofraud_attempts';
+	private const MAX_ATTEMPTS  = 3;
+	private const RETRY_HOOK    = 'nofraud_wc_retry_screen';
+
 	public static function init(): void {
+		add_action( self::RETRY_HOOK, [ __CLASS__, 'retry_screen' ], 10, 1 );
+
 		// Standards-compliant gateways fire this when they call $order->payment_complete().
 		add_action( 'woocommerce_payment_complete', [ __CLASS__, 'screen_order' ], 20, 1 );
 
@@ -31,7 +37,7 @@ class NoFraud_Order_Handler {
 	/**
 	 * Screen an order after payment is complete.
 	 */
-	public static function screen_order( int $order_id ): void {
+	public static function screen_order( int $order_id, bool $async = false ): void {
 		if ( ! NoFraud_Settings::is_enabled() ) {
 			return;
 		}
@@ -48,7 +54,13 @@ class NoFraud_Order_Handler {
 			return;
 		}
 
-		$skip = apply_filters( 'nofraud_wc_should_skip_order', self::order_is_ffl_only( $order ), $order );
+		// Per NoFraud: FFL-only orders are ours to skip (then uncovered) or to send with the
+		// dealer as shipTo (then covered). Never allowlist them on NoFraud's side instead.
+		$skip = apply_filters(
+			'nofraud_wc_should_skip_order',
+			! NoFraud_Settings::screen_ffl_orders() && self::order_is_ffl_only( $order ),
+			$order
+		);
 		if ( $skip ) {
 			$order->update_meta_data( NoFraud_Settings::META_DECISION, 'skipped' );
 			$order->add_order_note(
@@ -67,16 +79,12 @@ class NoFraud_Order_Handler {
 
 		NoFraud_Settings::log( 'NoFraud response for order #' . $order_id . ': ' . wp_json_encode( $result ) );
 
-		if ( empty( $result['success'] ) ) {
-			$error = $result['error'] ?? 'Unknown error';
-			$order->add_order_note(
-				sprintf(
-					/* translators: %s: error message */
-					__( 'NoFraud screening failed: %s', 'nofraud-woocommerce' ),
-					$error
-				)
-			);
+		// Transport/HTTP failures and an `error` decision both mean "not screened": record
+		// nothing final so a retry can still screen the order.
+		if ( empty( $result['success'] ) || 'error' === ( $result['decision'] ?? '' ) ) {
+			$error = $result['error'] ?? ( $result['message'] ?? 'NoFraud returned decision "error"' );
 			NoFraud_Settings::log( 'NoFraud screening error for order #' . $order_id . ': ' . $error, 'error' );
+			self::schedule_retry( $order, $error );
 			return;
 		}
 
@@ -92,10 +100,38 @@ class NoFraud_Order_Handler {
 		}
 		$order->save();
 
-		self::apply_decision( $order, $decision, $message );
+		self::apply_decision( $order, $decision, $message, $async );
 	}
 
-	private static function apply_decision( \WC_Order $order, string $decision, string $message = '' ): void {
+	public static function retry_screen( $order_id ): void {
+		$order = wc_get_order( (int) $order_id );
+		if ( ! $order || $order->has_status( [ 'cancelled', 'refunded', 'failed' ] ) ) {
+			return;
+		}
+		self::screen_order( (int) $order_id, true );
+	}
+
+	private static function schedule_retry( \WC_Order $order, string $error ): void {
+		$attempts = (int) $order->get_meta( self::META_ATTEMPTS ) + 1;
+		$order->update_meta_data( self::META_ATTEMPTS, (string) $attempts );
+
+		if ( $attempts < self::MAX_ATTEMPTS && function_exists( 'as_schedule_single_action' ) ) {
+			as_schedule_single_action( time() + 5 * MINUTE_IN_SECONDS, self::RETRY_HOOK, [ $order->get_id() ], 'nofraud' );
+			/* translators: 1: error message, 2: attempt number */
+			$note = sprintf( __( 'NoFraud screening failed: %1$s. Retrying in 5 minutes (attempt %2$d).', 'nofraud-woocommerce' ), $error, $attempts );
+		} else {
+			/* translators: %s: error message */
+			$note = sprintf( __( 'NoFraud screening failed: %s. Gave up retrying — this order was NOT screened; review it manually before fulfilment.', 'nofraud-woocommerce' ), $error );
+		}
+		$order->add_order_note( $note );
+		$order->save();
+	}
+
+	/**
+	 * @param bool $async True when the decision arrives after checkout (retry). The checkout
+	 *                    interceptor refunds synchronous fails; async cancellations refund here.
+	 */
+	private static function apply_decision( \WC_Order $order, string $decision, string $message = '', bool $async = false ): void {
 		switch ( $decision ) {
 			case 'pass':
 				$order->add_order_note(
@@ -113,12 +149,15 @@ class NoFraud_Order_Handler {
 					$message ? ' ' . $message : ''
 				);
 				NoFraud_Settings::apply_fail_decision( $order, $decision, $note );
+				if ( $async && 'cancel' === NoFraud_Settings::get_fail_action() ) {
+					NoFraud_Checkout::attempt_refund( $order );
+				}
 				break;
 
 			case 'review':
 				$note = __( 'NoFraud: Transaction is under manual review. The order will be updated when a decision is made.', 'nofraud-woocommerce' );
 				if ( 'hold' === NoFraud_Settings::get_review_action() ) {
-					$order->update_status( 'on-hold', $note );
+					NoFraud_Settings::hold( $order, $note );
 				} else {
 					$order->add_order_note( $note );
 				}
@@ -137,70 +176,122 @@ class NoFraud_Order_Handler {
 	}
 
 	/**
-	 * Returns true when every line item on the order requires FFL shipment.
-	 * Mixed carts (at least one non-FFL item) return false so they still get screened.
+	 * Returns true when every line item on the order ships to an FFL. Mixed carts
+	 * return false so they are always screened.
 	 */
 	private static function order_is_ffl_only( \WC_Order $order ): bool {
+		// ffl-core classifies the cart at checkout (firearms plus its state ammo /
+		// all-goods compliance rules) and stores the verdict on the order.
+		$type = (string) $order->get_meta( '_order_shipment_type' );
+		if ( '' !== $type ) {
+			return 'ffl_only' === $type;
+		}
+
+		// Orders ffl-core never classified (admin- or REST-created): firearm flag only.
 		$items = $order->get_items();
 		if ( empty( $items ) ) {
 			return false;
 		}
-
 		foreach ( $items as $item ) {
 			$product = $item->get_product();
-			if ( ! $product instanceof \WC_Product ) {
-				return false;
-			}
-			if ( ! self::product_requires_ffl( $product, $order ) ) {
+			if ( ! $product instanceof \WC_Product || ! self::is_firearm( $product ) ) {
 				return false;
 			}
 		}
-
 		return true;
 	}
 
-	/**
-	 * Prefer g-FFL Checkout's own helper (handles firearms + state ammunition compliance);
-	 * fall back to the `_firearm_product` meta (checking the variation's parent product too).
-	 */
-	private static function product_requires_ffl( \WC_Product $product, \WC_Order $order ): bool {
-		if ( function_exists( 'item_requires_ffl_shipment' ) ) {
-			return (bool) item_requires_ffl_shipment( $product, $order );
-		}
-
+	/** ffl-core's "Requires FFL Shipment" flag; variations inherit it from the parent. */
+	private static function is_firearm( \WC_Product $product ): bool {
 		if ( 'yes' === $product->get_meta( '_firearm_product' ) ) {
 			return true;
 		}
-
-		$parent_id = $product->get_parent_id();
-		if ( $parent_id ) {
-			$parent = wc_get_product( $parent_id );
-			if ( $parent && 'yes' === $parent->get_meta( '_firearm_product' ) ) {
-				return true;
-			}
-		}
-
-		return false;
+		$parent = $product->get_parent_id() ? wc_get_product( $product->get_parent_id() ) : null;
+		return $parent instanceof \WC_Product && 'yes' === $parent->get_meta( '_firearm_product' );
 	}
 
 	/**
-	 * Returns true only with positive evidence that the order's shipping_* fields hold
-	 * the FFL dealer address instead of the customer's own: g-FFL stored the dealer's
-	 * premise street separately and it matches the current shipping_address_1.
+	 * The address NoFraud should screen: where the covered goods actually go
+	 * (NoFraud's ruling, 2026-09-28 — coverage follows the address screened).
+	 *
+	 *  - Mixed cart, shopper sent the non-firearm items home (ffl-core `ffl_core_ship_home`)
+	 *    → that home address; the firearm on the FFL leg is not covered.
+	 *  - In-store pickup (the store's own FFL) → the store address, flagged isBopis.
+	 *  - Anything else going to a dealer → the dealer premise, which NoFraud matches
+	 *    against the ATF licensee list.
+	 *  - Otherwise (regular goods, C&R to the collector) → the order's shipping address.
+	 *
+	 * @return array{0: array<string,string>|null, 1: bool} [shipTo, isBopis]
 	 */
-	private static function shipping_address_is_ffl_dealer( \WC_Order $order ): bool {
-		if ( ! $order->get_meta( '_shipping_fflno' ) ) {
-			return false;
-		}
-		if ( 'yes' === $order->get_meta( '_is_mixed_cart_order' ) ) {
-			return false;
+	private static function resolve_ship_to( \WC_Order $order ): array {
+		$first = $order->get_shipping_first_name() ?: $order->get_billing_first_name();
+		$last  = $order->get_shipping_last_name() ?: $order->get_billing_last_name();
+
+		$home = $order->get_meta( 'ffl_core_ship_home' );
+		if ( is_array( $home ) && ! empty( $home['address_1'] ) ) {
+			return [ self::address( [
+				'firstName' => $home['first_name'] ?? $first,
+				'lastName'  => $home['last_name'] ?? $last,
+				'address'   => trim( ( $home['address_1'] ?? '' ) . ' ' . ( $home['address_2'] ?? '' ) ),
+				'city'      => $home['city'] ?? '',
+				'state'     => $home['state'] ?? '',
+				'zip'       => $home['postcode'] ?? '',
+				'country'   => ( $home['country'] ?? '' ) ?: $order->get_shipping_country(),
+			] ), false ];
 		}
 
-		$ffl_premise_street = trim( (string) $order->get_meta( '_shipping_ffl_premise_street' ) );
-		$order_shipping_1   = trim( (string) $order->get_shipping_address_1() );
+		$license = trim( (string) $order->get_meta( '_shipping_fflno' ) );
+		$pickup  = trim( (string) get_option( 'ffl_core_in_store_pickup_license', '' ) );
+		if ( '' !== $license && $license === $pickup ) {
+			$wc = WC()->countries;
+			return [ self::address( [
+				'firstName' => $first,
+				'lastName'  => $last,
+				'company'   => get_bloginfo( 'name' ),
+				'address'   => trim( $wc->get_base_address() . ' ' . $wc->get_base_address_2() ),
+				'city'      => $wc->get_base_city(),
+				'state'     => $wc->get_base_state(),
+				'zip'       => $wc->get_base_postcode(),
+				'country'   => $wc->get_base_country(),
+			] ), true ];
+		}
 
-		return $ffl_premise_street !== '' && $order_shipping_1 !== ''
-			&& 0 === strcasecmp( $ffl_premise_street, $order_shipping_1 );
+		$premise = trim( (string) $order->get_meta( '_shipping_ffl_premise_street' ) );
+		if ( '' !== $license && '' !== $premise ) {
+			return [ self::address( [
+				'firstName' => $first,
+				'lastName'  => $last,
+				'company'   => (string) $order->get_meta( '_shipping_ffl_name' ),
+				'address'   => $premise,
+				'city'      => (string) $order->get_meta( '_shipping_ffl_premise_city' ),
+				'state'     => (string) $order->get_meta( '_shipping_ffl_premise_state' ),
+				'zip'       => (string) $order->get_meta( '_shipping_ffl_premise_zip' ),
+				'country'   => 'US',
+			] ), false ];
+		}
+
+		if ( $order->has_shipping_address() ) {
+			return [ self::address( [
+				'firstName' => $first,
+				'lastName'  => $last,
+				'company'   => $order->get_shipping_company(),
+				'address'   => trim( $order->get_shipping_address_1() . ' ' . $order->get_shipping_address_2() ),
+				'city'      => $order->get_shipping_city(),
+				'state'     => $order->get_shipping_state(),
+				'zip'       => $order->get_shipping_postcode(),
+				'country'   => $order->get_shipping_country(),
+			] ), false ];
+		}
+
+		return [ null, false ];
+	}
+
+	/** Drop empty fields and clip to NoFraud's 128-char address limit. */
+	private static function address( array $fields ): array {
+		return array_map(
+			static fn( $v ) => mb_substr( (string) $v, 0, 128 ),
+			array_filter( $fields, static fn( $v ) => '' !== trim( (string) $v ) )
+		);
 	}
 
 	private static function build_transaction_data( \WC_Order $order ): array {
@@ -240,7 +331,8 @@ class NoFraud_Order_Handler {
 			}
 		}
 
-		$data['billTo'] = array_filter( [
+		// Required by the API even when empty — cast so an empty one encodes as {} not [].
+		$data['billTo'] = (object) self::address( [
 			'firstName'   => $order->get_billing_first_name(),
 			'lastName'    => $order->get_billing_last_name(),
 			'company'     => $order->get_billing_company(),
@@ -252,31 +344,20 @@ class NoFraud_Order_Handler {
 			'phoneNumber' => $order->get_billing_phone(),
 		] );
 
-		// For mixed FFL/non-FFL orders, g-FFL Checkout preserves the customer's shipping
-		// address so non-FFL items can ship to them. If preservation failed and shipping_*
-		// holds the dealer premise, reuse billTo as shipTo so NoFraud's geo heuristics
-		// aren't corrupted by a dealer address.
-		if ( self::shipping_address_is_ffl_dealer( $order ) ) {
-			NoFraud_Settings::log(
-				'Order #' . $order->get_id() . ' shipping address matches the FFL dealer premise. '
-				. 'Falling back to billing address for NoFraud shipTo.',
-				'warning'
-			);
-			$data['shipTo'] = array_intersect_key(
-				$data['billTo'],
-				array_flip( [ 'firstName', 'lastName', 'address', 'city', 'state', 'zip', 'country' ] )
-			);
-		} elseif ( $order->has_shipping_address() ) {
-			$data['shipTo'] = array_filter( [
-				'firstName' => $order->get_shipping_first_name(),
-				'lastName'  => $order->get_shipping_last_name(),
-				'company'   => $order->get_shipping_company(),
-				'address'   => trim( $order->get_shipping_address_1() . ' ' . $order->get_shipping_address_2() ),
-				'city'      => $order->get_shipping_city(),
-				'state'     => $order->get_shipping_state(),
-				'zip'       => $order->get_shipping_postcode(),
-				'country'   => $order->get_shipping_country(),
-			] );
+		[ $ship_to, $is_bopis ] = self::resolve_ship_to( $order );
+		if ( $ship_to ) {
+			$data['shipTo'] = $ship_to;
+		}
+		if ( $is_bopis ) {
+			$data['isBopis'] = 'true';
+		}
+
+		$user_fields = array_filter( [
+			'fflLicense'   => (string) $order->get_meta( '_shipping_fflno' ),
+			'shipmentType' => (string) $order->get_meta( '_order_shipment_type' ),
+		] );
+		if ( $user_fields ) {
+			$data['userFields'] = $user_fields;
 		}
 
 		$shipping_total = $order->get_shipping_total();
@@ -293,6 +374,14 @@ class NoFraud_Order_Handler {
 		$discount = $order->get_discount_total();
 		if ( $discount > 0 ) {
 			$data['discountAmount'] = (string) $discount;
+		}
+
+		if ( $order->get_transaction_id() ) {
+			$data['transaction-id'] = $order->get_transaction_id();
+		}
+		$authcode = self::extract_first_meta( $order, [ '_payroc_approval_code' ] );
+		if ( $authcode ) {
+			$data['authcode'] = $authcode;
 		}
 
 		$avs_cvv = self::extract_avs_cvv( $order );
@@ -393,9 +482,8 @@ class NoFraud_Order_Handler {
 			}
 		}
 
-		if ( ! empty( $credit_card ) ) {
-			$payment['creditCard'] = $credit_card;
-		}
+		// creditCard is required by the API; send {} rather than omit it when the gateway exposed nothing.
+		$payment['creditCard'] = (object) $credit_card;
 
 		return $payment;
 	}
@@ -431,9 +519,13 @@ class NoFraud_Order_Handler {
 			'_cvv_result_code',
 		];
 
+		// NoFraud takes gateway result codes only (AVS ≤3 chars, CVV 1 uppercase char);
+		// drop anything else (e.g. Stripe's "pass"/"unavailable") rather than fail the request.
+		$avs = strtoupper( trim( self::extract_first_meta( $order, $avs_keys ) ) );
+		$cvv = strtoupper( trim( self::extract_first_meta( $order, $cvv_keys ) ) );
 		return [
-			'avs' => self::extract_first_meta( $order, $avs_keys ),
-			'cvv' => self::extract_first_meta( $order, $cvv_keys ),
+			'avs' => strlen( $avs ) <= 3 ? $avs : '',
+			'cvv' => 1 === strlen( $cvv ) ? $cvv : '',
 		];
 	}
 }

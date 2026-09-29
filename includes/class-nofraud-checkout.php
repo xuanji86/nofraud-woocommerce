@@ -13,12 +13,13 @@ defined( 'ABSPATH' ) || exit;
 
 class NoFraud_Checkout {
 
-	private const ERROR_MESSAGE_KEY = 'nofraud_checkout_error';
 	private const META_REFUND_ATTEMPTED = '_nofraud_refund_attempted';
 
 	public static function init(): void {
 		add_filter( 'woocommerce_payment_successful_result', [ __CLASS__, 'intercept_classic_checkout' ], 999, 2 );
-		add_action( 'woocommerce_store_api_checkout_order_processed', [ __CLASS__, 'intercept_block_checkout' ], 999, 1 );
+		// The Store API fires checkout_order_processed BEFORE taking payment, so the decision
+		// only exists after the payment hook; run after WC's legacy gateway bridge (999).
+		add_action( 'woocommerce_rest_checkout_process_payment_with_context', [ __CLASS__, 'intercept_block_checkout' ], 1000, 2 );
 	}
 
 	public static function intercept_classic_checkout( array $result, int $order_id ): array {
@@ -50,12 +51,21 @@ class NoFraud_Checkout {
 	}
 
 	/**
-	 * @throws \Automattic\WooCommerce\StoreApi\Exceptions\RouteException
+	 * @param \Automattic\WooCommerce\StoreApi\Payments\PaymentContext $context
+	 * @param \Automattic\WooCommerce\StoreApi\Payments\PaymentResult  $result
+	 * @throws \Exception Caught by the Store API and returned to the shopper as a 400 checkout error.
 	 */
-	public static function intercept_block_checkout( \WC_Order $order ): void {
+	public static function intercept_block_checkout( $context, $result ): void {
 		if ( ! NoFraud_Settings::is_enabled() ) {
 			return;
 		}
+
+		$order = $context->order ?? null;
+		if ( ! $order instanceof \WC_Order ) {
+			return;
+		}
+		// Payment just updated the order in another instance; read the decision fresh.
+		$order = wc_get_order( $order->get_id() );
 
 		$decision = $order->get_meta( NoFraud_Settings::META_DECISION );
 		if ( ! NoFraud_Settings::is_fail_decision( $decision ) ) {
@@ -66,19 +76,13 @@ class NoFraud_Checkout {
 
 		self::attempt_refund( $order );
 
-		if ( class_exists( \Automattic\WooCommerce\StoreApi\Exceptions\RouteException::class ) ) {
-			throw new \Automattic\WooCommerce\StoreApi\Exceptions\RouteException(
-				self::ERROR_MESSAGE_KEY,
-				self::get_error_message(),
-				400
-			);
-		}
+		throw new \Exception( self::get_error_message() );
 	}
 
 	/**
 	 * Attempt a full refund. Guarded against double execution.
 	 */
-	private static function attempt_refund( \WC_Order $order ): void {
+	public static function attempt_refund( \WC_Order $order ): void {
 		// Prevent double refund if both classic and block hooks fire.
 		if ( $order->get_meta( self::META_REFUND_ATTEMPTED ) ) {
 			return;

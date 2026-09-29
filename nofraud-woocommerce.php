@@ -3,7 +3,7 @@
  * Plugin Name: NoFraud for WooCommerce
  * Plugin URI:  https://www.nofraud.com
  * Description: Credit card fraud detection for WooCommerce powered by NoFraud.
- * Version:     1.2.3
+ * Version:     1.3.0
  * Author:      Anji Xu
  * License:     GPL-2.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -12,12 +12,12 @@
  * Tested up to: 6.9.4
  * Requires PHP: 8.0
  * WC requires at least: 8.0
- * WC tested up to: 9.8
+ * WC tested up to: 11.0
  */
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'NOFRAUD_WC_VERSION', '1.2.3' );
+define( 'NOFRAUD_WC_VERSION', '1.3.0' );
 define( 'NOFRAUD_WC_PLUGIN_FILE', __FILE__ );
 define( 'NOFRAUD_WC_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'NOFRAUD_WC_PLUGIN_URL', plugin_dir_url( __FILE__ ) );

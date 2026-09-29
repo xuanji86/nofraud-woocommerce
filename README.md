@@ -17,7 +17,7 @@ This plugin integrates the NoFraud fraud screening API into your WooCommerce sto
 - **Admin UI** — Color-coded decision badges on the orders list, a detailed meta box on order edit pages, and a direct link to the NoFraud Portal for each transaction.
 - **API connection test** — One-click button in settings to verify your API key (works with unsaved values).
 - **Payroc gateway support** — Compatibility layer that intercepts Payroc's XML API responses to capture AVS, CVV, and card data that the Payroc plugin discards.
-- **Firearm / FFL awareness** — Orders whose line items all require FFL shipment (via [g-FFL Checkout](https://wordpress.org/plugins/g-ffl-checkout/)) are skipped automatically, since the delivery address is a licensed dealer rather than the customer. Mixed carts (FFL + non-FFL) are still screened, using the customer's own shipping address.
+- **Firearm / FFL awareness (ffl-core)** — FFL-only orders are skipped by default (or screened with the dealer as ship-to when enabled); mixed carts are screened against the address the covered goods actually ship to. See [FFL / Firearm Order Handling](#ffl--firearm-order-handling).
 - **Works with gateways that skip `payment_complete()`** — Screening is hooked onto order status transitions (`processing`, `completed`) as well as `woocommerce_payment_complete`, so gateways like Payroc that move orders straight to `processing` are still covered.
 - **HPOS compatible** — Fully supports WooCommerce High-Performance Order Storage.
 - **Debug logging** — Optional logging to WooCommerce > Status > Logs for troubleshooting.
@@ -114,17 +114,18 @@ is screened exactly once.
 
 ### FFL / Firearm Order Handling
 
-If the [g-FFL Checkout](https://wordpress.org/plugins/g-ffl-checkout/) plugin is active, the screening logic becomes FFL-aware:
+FFL awareness reads the order meta written by **ffl-core** (the OSA/CGA FFL checkout plugin). The rules follow NoFraud's guidance (2026-09-28): coverage follows the address that is screened, and FFL orders must not be allowlisted on NoFraud's side.
 
-| Cart contents | NoFraud behavior | `shipTo` sent |
-|---------------|------------------|---------------|
-| All items require FFL shipment (firearms / ammunition under state compliance) | **Skipped.** An order note is added and the skip is logged. | — |
-| Mix of FFL and non-FFL items | Screened normally. | Customer's own shipping address (g-FFL preserves it on mixed-cart orders). |
-| No FFL items | Screened normally. | Customer's shipping address. |
+| Order | NoFraud behavior | `shipTo` sent |
+|-------|------------------|---------------|
+| Every item ships to an FFL (`_order_shipment_type = ffl_only`) | Skipped with an order note (not covered) — unless **FFL-only Orders** is checked, then screened (covered). | Dealer premise from ffl-core (`_shipping_ffl_premise_*`); NoFraud matches it against the ATF licensee list. |
+| Mixed cart, shopper sent the non-firearm items home (`ffl_core_ship_home`) | Screened; all items (firearm included) in `lineItems`. Only the home-bound items are covered. | Customer's home address. |
+| Mixed cart, everything to the FFL (ffl-core default) | Screened. | Dealer premise. |
+| In-store pickup (the store's own FFL, `ffl_core_in_store_pickup_license`) | Screened when not skipped; `isBopis: "true"`. | Store base address. |
+| C&R transfer (ships to the collector) | As above. | Order shipping address (the collector's). |
+| No FFL items | Screened. | Order shipping address. |
 
-The "all-FFL" check uses g-FFL Checkout's own `item_requires_ffl_shipment()` helper when available, and falls back to the `_firearm_product` product meta when it isn't.
-
-As a defensive measure, if the order's shipping address appears to be a dealer premise (indicating g-FFL's mixed-cart support is disabled or the address was overwritten), the plugin sends the customer's **billing** address as `shipTo` instead, so NoFraud's geo/velocity heuristics aren't skewed by a dealer address. A warning is logged when this fallback triggers.
+Orders ffl-core never classified (admin/REST-created) fall back to the `_firearm_product` flag (variations inherit the parent's). The FFL license and shipment type also go to NoFraud reviewers in `userFields`.
 
 The skip logic is filterable — customize it by hooking `nofraud_wc_should_skip_order`:
 
@@ -191,9 +192,18 @@ The Payroc WooCommerce plugin extracts AVS, CVV, and approval codes from gateway
 
 ### Why are firearm orders being skipped?
 
-When the [g-FFL Checkout](https://wordpress.org/plugins/g-ffl-checkout/) plugin is active, orders whose line items *all* require FFL shipment are skipped automatically: the physical destination is a licensed dealer, not the customer, so running the billing/shipping address through NoFraud's geo heuristics produces noise rather than signal. Mixed carts (FFL + non-FFL items) are still screened against the customer's own shipping address. See the [FFL / Firearm Order Handling](#ffl--firearm-order-handling) section above for the full behavior matrix and the `nofraud_wc_should_skip_order` filter.
+Firearm-only orders ship to a licensed dealer and the buyer passes a 4473/NICS check in person, so by default they are not sent (same as the old Coreware setup). They are then **not covered** by chargeback protection. Check **FFL-only Orders** in settings to send them with the dealer as `shipTo` and get coverage. See [FFL / Firearm Order Handling](#ffl--firearm-order-handling).
 
 ## Changelog
+
+### 1.3.0
+
+- **ffl-core compatibility** (replaces g-FFL Checkout): FFL-only detection from `_order_shipment_type`; `shipTo` = home address on split mixed carts, dealer premise otherwise, store address + `isBopis` for in-store pickup. New **FFL-only Orders** setting (default off = skip).
+- **Fix: Block checkout never intercepted a fail.** The hook ran before payment; it now runs after the Store API payment hook and returns the error to the shopper.
+- **Fix: Payroc AVS/CVV/card data was never captured** — the host allowlist did not match Payroc 2.7.9.x (`payments.payroc.com` / `payments.uat.payroc.com`).
+- **Webhook hardening:** the payload is only a trigger; the decision is re-read from `GET /status/{nf-token}/{id}`. `id` may be the portal URL. A `pass` releases only holds NoFraud placed (not ffl-core restricted-state or staff holds); a late `fail` on a completed order only adds a note; async cancels now refund.
+- **API conformance:** create-transaction posts to `/transaction`; `payment.creditCard` and `billTo` are always objects; AVS/CVV codes outside the API's length limits are dropped; gateway `transaction-id` / `authcode` are sent; addresses clipped to 128 chars.
+- **Retries:** a transport failure or `error` decision is retried up to 3 times (5 min apart, Action Scheduler) instead of leaving the order silently unscreened.
 
 ### 1.2.1
 

@@ -15,6 +15,8 @@ class NoFraud_Settings {
 	public const META_SCREENED_AT        = '_nofraud_screened_at';
 	public const META_MESSAGE            = '_nofraud_message';
 	public const META_WEBHOOK_UPDATED_AT = '_nofraud_webhook_updated_at';
+	/** Set when NoFraud itself put the order on hold, so a later pass only releases its own holds. */
+	public const META_HOLD               = '_nofraud_hold';
 
 	public static function init(): void {
 		add_action( 'admin_menu', [ __CLASS__, 'add_menu_page' ] );
@@ -363,7 +365,7 @@ class NoFraud_Settings {
 		];
 
 		$response = wp_remote_post(
-			'https://apitest.nofraud.com/',
+			'https://apitest.nofraud.com/transaction',
 			[
 				'timeout' => 30,
 				'headers' => [ 'Content-Type' => 'application/json' ],
@@ -470,6 +472,13 @@ class NoFraud_Settings {
 				],
 				'default' => 'hold',
 			],
+			'screen_ffl_orders' => [
+				'name'    => __( 'FFL-only Orders', 'nofraud-woocommerce' ),
+				'type'    => 'checkbox',
+				'desc'    => __( 'Screen orders where every item ships to an FFL dealer (sent with the dealer as the ship-to address). Only screened orders are covered by chargeback protection; unchecked skips them.', 'nofraud-woocommerce' ),
+				'id'      => 'nofraud_wc_screen_ffl_orders',
+				'default' => 'no',
+			],
 			'debug_logging' => [
 				'name'    => __( 'Debug Logging', 'nofraud-woocommerce' ),
 				'type'    => 'checkbox',
@@ -505,6 +514,20 @@ class NoFraud_Settings {
 		return get_option( 'nofraud_wc_fail_action', 'cancel' );
 	}
 
+	public static function screen_ffl_orders(): bool {
+		return 'yes' === get_option( 'nofraud_wc_screen_ffl_orders', 'no' );
+	}
+
+	/**
+	 * Put the order on hold on NoFraud's behalf; the marker lets a later pass release
+	 * only this hold, never one placed by staff or another plugin (e.g. ffl-core's
+	 * restricted-state guard).
+	 */
+	public static function hold( \WC_Order $order, string $note ): void {
+		$order->update_meta_data( self::META_HOLD, '1' );
+		$order->update_status( 'on-hold', $note );
+	}
+
 	public static function get_review_action(): string {
 		return get_option( 'nofraud_wc_review_action', 'hold' );
 	}
@@ -521,7 +544,7 @@ class NoFraud_Settings {
 		if ( 'cancel' === self::get_fail_action() ) {
 			$order->update_status( 'cancelled', $note );
 		} else {
-			$order->update_status( 'on-hold', $note );
+			self::hold( $order, $note );
 		}
 	}
 

@@ -16,7 +16,9 @@ class NoFraud_API {
 		if ( ! $mode ) {
 			$mode = get_option( 'nofraud_wc_mode', 'test' );
 		}
-		return 'live' === $mode ? self::LIVE_URL : self::TEST_URL;
+		$url = 'live' === $mode ? self::LIVE_URL : self::TEST_URL;
+		// Lets a local run point at NoFraud's mock server instead of a real endpoint.
+		return untrailingslashit( (string) apply_filters( 'nofraud_wc_api_base_url', $url, $mode ) );
 	}
 
 	/**
@@ -47,7 +49,7 @@ class NoFraud_API {
 		$data['nf-token'] = $token;
 
 		$response = wp_remote_post(
-			self::get_base_url() . '/',
+			self::get_base_url() . '/transaction',
 			[
 				'timeout' => 30,
 				'headers' => [ 'Content-Type' => 'application/json' ],
