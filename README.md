@@ -205,6 +205,10 @@ Firearm-only orders ship to a licensed dealer and the buyer passes a 4473/NICS c
 
 ## Changelog
 
+### 1.3.1
+- shipTo now carries a phone number: the dealer's phone when shipping to an FFL premise, otherwise the customer's billing phone (ffl-core overwrites the order's shipping phone with the dealer's).
+- `gatewayName` sends the processor (`Payroc`) instead of the checkout label.
+
 ### 1.3.0
 
 - **ffl-core compatibility** (g-FFL Checkout still supported): FFL-only detection from `_order_shipment_type`; `shipTo` = home address on split mixed carts, dealer premise otherwise, store address + `isBopis` for in-store pickup. New **FFL Orders** setting: skip anything going to an FFL address (default) / skip FFL-only / screen all.

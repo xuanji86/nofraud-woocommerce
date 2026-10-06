@@ -82,6 +82,7 @@ $ffl = [
 	'_shipping_ffl_premise_city'   => 'Dallas',
 	'_shipping_ffl_premise_state'  => 'TX',
 	'_shipping_ffl_premise_zip'    => '75201',
+	'_shipping_ffl_phone'          => '2145550199',
 ];
 $pickup_license = (string) get_option( 'ffl_core_in_store_pickup_license', '' ) ?: '5-75-000-01-9Z-00000';
 update_option( 'ffl_core_in_store_pickup_license', $pickup_license );
@@ -103,6 +104,15 @@ foreach ( $cases as $name => [ $items, $meta, $street ] ) {
 		$check( "shipTo $name: store address + isBopis", 'true' === ( $d['isBopis'] ?? '' ) && ! empty( $d['shipTo']['address'] ) );
 	} else {
 		$check( "shipTo $name", $street === ( $d['shipTo']['address'] ?? '' ), wp_json_encode( $d['shipTo'] ?? null ) );
+	}
+	$want_phone = '500 Dealer Rd' === $street ? '2145550199' : '5125550100';
+	$check( "shipTo $name: phone", $want_phone === ( $d['shipTo']['phoneNumber'] ?? '' ), $d['shipTo']['phoneNumber'] ?? '' );
+	if ( 'regular' === $name ) {
+		$check( 'billTo phone', '5125550100' === ( $d['billTo']->phoneNumber ?? '' ) );
+		$o = $mk( $items, $meta );
+		$o->set_payment_method( 'payroc' );
+		$o->set_payment_method_title( 'Debit or Credit Card' );
+		$check( 'gatewayName is processor', 'Payroc' === $build->invoke( null, $o )['gatewayName'] );
 	}
 }
 
