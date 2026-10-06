@@ -262,6 +262,8 @@ class NoFraud_Order_Handler {
 	private static function resolve_ship_to( \WC_Order $order ): array {
 		$first = $order->get_shipping_first_name() ?: $order->get_billing_first_name();
 		$last  = $order->get_shipping_last_name() ?: $order->get_billing_last_name();
+		// Billing phone, not shipping: ffl-core overwrites the shipping phone with the dealer's.
+		$phone = $order->get_billing_phone();
 
 		$home = $order->get_meta( 'ffl_core_ship_home' );
 		if ( is_array( $home ) && ! empty( $home['address_1'] ) ) {
@@ -273,6 +275,7 @@ class NoFraud_Order_Handler {
 				'state'     => $home['state'] ?? '',
 				'zip'       => $home['postcode'] ?? '',
 				'country'   => ( $home['country'] ?? '' ) ?: $order->get_shipping_country(),
+				'phoneNumber' => $phone,
 			] ), false, false );
 		}
 
@@ -293,6 +296,7 @@ class NoFraud_Order_Handler {
 				'state'     => $order->{"get_{$type}_state"}(),
 				'zip'       => $order->{"get_{$type}_postcode"}(),
 				'country'   => $order->{"get_{$type}_country"}(),
+				'phoneNumber' => $phone,
 			] ), false, false );
 		}
 
@@ -309,6 +313,7 @@ class NoFraud_Order_Handler {
 				'state'     => $wc->get_base_state(),
 				'zip'       => $wc->get_base_postcode(),
 				'country'   => $wc->get_base_country(),
+				'phoneNumber' => $phone,
 			] ), true, true );
 		}
 
@@ -322,6 +327,7 @@ class NoFraud_Order_Handler {
 				'state'     => (string) $order->get_meta( '_shipping_ffl_premise_state' ),
 				'zip'       => (string) $order->get_meta( '_shipping_ffl_premise_zip' ),
 				'country'   => 'US',
+				'phoneNumber' => (string) $order->get_meta( '_shipping_ffl_phone' ),
 			] ), false, true );
 		}
 
@@ -335,6 +341,7 @@ class NoFraud_Order_Handler {
 				'state'     => $order->get_shipping_state(),
 				'zip'       => $order->get_shipping_postcode(),
 				'country'   => $order->get_shipping_country(),
+				'phoneNumber' => $phone,
 			] ), false, false );
 		}
 
@@ -343,6 +350,12 @@ class NoFraud_Order_Handler {
 
 	private static function ship( ?array $ship_to, bool $bopis, bool $to_ffl ): array {
 		return [ 'ship_to' => $ship_to, 'bopis' => $bopis, 'to_ffl' => $to_ffl ];
+	}
+
+	/** NoFraud wants the processor, not the checkout label ("Debit or Credit Card"). */
+	private static function gateway_name( \WC_Order $order ): string {
+		$processors = [ 'payroc' => 'Payroc' ];
+		return $processors[ $order->get_payment_method() ] ?? $order->get_payment_method_title();
 	}
 
 	/** Drop empty fields and clip to NoFraud's 128-char address limit. */
@@ -362,7 +375,7 @@ class NoFraud_Order_Handler {
 		$data = [
 			'amount'      => $order->get_total(),
 			'customerIP'  => $order->get_customer_ip_address(),
-			'gatewayName' => $order->get_payment_method_title(),
+			'gatewayName' => self::gateway_name( $order ),
 			'payment'     => self::build_payment_data( $order ),
 			'app'         => 'nofraud-woocommerce',
 			'appVersion'  => NOFRAUD_WC_VERSION,
